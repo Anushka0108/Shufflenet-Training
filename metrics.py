@@ -1,3 +1,4 @@
+
 import time
 import torch
 import torch.nn as nn
@@ -63,6 +64,7 @@ def evaluate_reid(model, query_loader, gallery_loader, device):
             (ordered_pids == query_pid) &
             (ordered_camids == query_camid)
         )
+
         matches = (ordered_pids[keep] == query_pid)
 
         if not matches.any():
@@ -73,15 +75,20 @@ def evaluate_reid(model, query_loader, gallery_loader, device):
 
         first_match = int(match_positions[0])
         end = min(20, len(matches))
+
         if first_match < end:
             cmc_sum[first_match:end] += 1
 
-        positions = match_positions.to(torch.float32) + 1
-        precisions = (
-            torch.arange(1, len(matches) + 1, dtype=torch.float32)[
-                match_positions
-            ] / positions
+        ranks = torch.arange(
+            1, len(matches) + 1, dtype=torch.float32
         )
+        cumulative_matches = matches.to(torch.float32).cumsum(dim=0)
+
+        precisions = (
+            cumulative_matches[match_positions]
+            / ranks[match_positions]
+        )
+
         average_precisions.append(precisions.mean().item())
 
     if valid_queries == 0:
@@ -90,14 +97,28 @@ def evaluate_reid(model, query_loader, gallery_loader, device):
         )
 
     cmc = cmc_sum / valid_queries
-    return {
+    mean_ap = sum(average_precisions) / len(average_precisions)
+
+    results = {
         "Rank-1": 100.0 * cmc[0].item(),
         "Rank-5": 100.0 * cmc[4].item(),
         "Rank-10": 100.0 * cmc[9].item(),
         "Rank-20": 100.0 * cmc[19].item(),
-        "mAP": 100.0 * sum(average_precisions) / len(average_precisions),
+        "mAP": 100.0 * mean_ap,
         "Valid Queries": valid_queries,
     }
+
+    print(f"Valid queries: {valid_queries}")
+    print(f"Minimum AP: {min(average_precisions):.6f}")
+    print(f"Maximum AP: {max(average_precisions):.6f}")
+    print(f"Mean AP: {mean_ap:.6f}")
+    print(f"Rank-1: {results['Rank-1']:.6f}%")
+    print(f"Rank-5: {results['Rank-5']:.6f}%")
+    print(f"Rank-10: {results['Rank-10']:.6f}%")
+    print(f"Rank-20: {results['Rank-20']:.6f}%")
+    print(f"mAP: {results['mAP']:.6f}%")
+
+    return results
 
 
 def model_complexity(model, input_shape, device):
@@ -108,8 +129,10 @@ def model_complexity(model, input_shape, device):
         nonlocal macs
         if not isinstance(output, torch.Tensor):
             return
+
         kernel_h, kernel_w = module.kernel_size
         output_elements = output.numel()
+
         macs += (
             output_elements
             * (module.in_channels // module.groups)
@@ -124,26 +147,33 @@ def model_complexity(model, input_shape, device):
 
     for module in model.modules():
         if isinstance(module, nn.Conv2d):
-            handles.append(module.register_forward_hook(conv_hook))
+            handles.append(
+                module.register_forward_hook(conv_hook)
+            )
         elif isinstance(module, nn.Linear):
-            handles.append(module.register_forward_hook(linear_hook))
+            handles.append(
+                module.register_forward_hook(linear_hook)
+            )
 
     was_training = model.training
     model.eval()
 
-    dummy = torch.zeros(input_shape, device=device)
-    with torch.inference_mode():
-        model.forward_embeddings(dummy)
+    try:
+        dummy = torch.zeros(input_shape, device=device)
 
-    for handle in handles:
-        handle.remove()
+        with torch.inference_mode():
+            model.forward_embeddings(dummy)
+    finally:
+        for handle in handles:
+            handle.remove()
 
-    model.train(was_training)
+        model.train(was_training)
 
     inference_parameters = (
         sum(p.numel() for p in model.backbone.parameters())
         + sum(p.numel() for p in model.bottleneck.parameters())
     )
+
     total_parameters = sum(p.numel() for p in model.parameters())
 
     return {
